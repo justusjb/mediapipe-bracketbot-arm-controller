@@ -6,7 +6,28 @@ import argparse
 import opencv_cam
 import depthai_cam
 import struct
-import time
+import json, socket, time
+
+ROBOT_IP   = "10.42.0.1"   # <-- robot's Wi-Fi IP
+ROBOT_PORT = 5005
+TOKEN      = "secret"
+HZ         = 50
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+addr = (ROBOT_IP, ROBOT_PORT)
+
+def send(msg):
+    msg["token"] = TOKEN
+    sock.sendto(json.dumps(msg).encode("utf-8"), addr)
+
+def torque(enable: bool):
+    send({"type":"torque", "enable": bool(enable), "seq": int(time.time()*1000)})
+
+def arm_cmd(pos):
+    send({"type":"arm_cmd", "pos": list(map(float, pos)), "seq": int(time.time()*1000)})
+
+def ping():
+    send({"type":"ping", "seq": int(time.time()*1000)})
 
 mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
@@ -444,7 +465,11 @@ if cvcam.start() is False:
 # Create array with enough space for all calculated angles
 joint_angles = np.zeros(23)
 is_valid_frame = False
-    
+
+
+print("Enabling robot motors...")
+torque(True)
+time.sleep(0.1)
 
 # Process the video stream
 with mp_holistic.Holistic(
@@ -584,6 +609,31 @@ with mp_holistic.Holistic(
         # Grab our points of interest for easy access
         right_elbow_angle,right_shoulder_yaw,right_shoulder_pitch,pitchmode = calculate_pose_angles(results.pose_world_landmarks)
 
+        # Map to SO-101 joints with proper scaling
+        robot_pos = [0.0] * 6
+        # SO-101 joint mapping (convert degrees to motor positions)
+        # Motor range: 0-4096 steps, center at 2048, ±180° = ±2048 steps
+
+        # Base rotation from shoulder yaw (horizontal arm movement)
+        base_angle = (right_shoulder_yaw - 90.0) * 0.3  # Scale down movement
+        robot_pos[0] = max(-1.0, min(1.0, base_angle * np.pi / 180))  # Convert to radians, clamp
+
+        # Shoulder pitch (arm up/down)
+        shoulder_angle = (right_shoulder_pitch - 90.0) * 0.4
+        robot_pos[1] = max(-1.0, min(1.0, shoulder_angle * np.pi / 180))
+
+        # Elbow bend
+        elbow_angle = (right_elbow_angle - 90.0) * 0.5
+        robot_pos[3] = max(-1.0, min(1.0, elbow_angle * np.pi / 180))
+
+        # Keep other joints neutral for now
+        robot_pos[2] = 0.0  # Shoulder roll
+        robot_pos[4] = 0.0  # Wrist pitch
+        robot_pos[5] = 0.0  # Wrist roll
+
+        # Send to robot
+        arm_cmd(robot_pos)
+
         joint_angles[19] = right_shoulder_pitch
         joint_angles[20] = right_shoulder_yaw
         joint_angles[21] = 0.0 # Right shoulder roll TBD
@@ -617,6 +667,10 @@ with mp_holistic.Holistic(
 
     # Flip the image horizontally for a selfie-view display.
     flipped_image = cv2.flip(image, 1)
+
+    # Debug display
+    cv2.putText(flipped_image, f"Robot: Base:{robot_pos[0]:.2f} Sho:{robot_pos[1]:.2f} Elb:{robot_pos[3]:.2f}",
+                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
     # Add annotations after flipping the image
     if is_valid_frame and show_debug_views:
@@ -667,7 +721,9 @@ with mp_holistic.Holistic(
         cv2.destroyWindow('XZ Plane (Top View)')
         cv2.destroyWindow('XY Plane (Front View)')
     
-      
+print("Disabling robot motors...")
+torque(False)
+
 # Clean up camera and windows
 cvcam.stop()
 cv2.destroyAllWindows()
